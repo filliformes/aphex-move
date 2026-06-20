@@ -46,6 +46,7 @@
 #define PI          3.14159265359f
 #define TWO_PI      6.28318530718f
 #define VEL_FLOOR   0.25f   /* softest-pad-hit gain floor (at full Vel→Amp depth) */
+#define SMOOTH_20MS 0.0011331f  /* per-sample one-pole coef ≈ 20 ms TC at 44.1 kHz */
 
 #define BLOCK       128
 
@@ -307,6 +308,8 @@ typedef struct {
      * smoothing, the tanh saturation level jumps abruptly. ~20ms time constant. */
     float sm_lpf_cut, sm_hpf_cut, sm_lpf_reso, sm_hpf_reso;
     float sm_drive;
+    float sm_v1_pitch, sm_v2_pitch;  /* 20ms-smoothed static pitch (knob glide) */
+    float sm_volume, sm_mg_depth;    /* 20ms-smoothed master volume / LFO depth */
 
     /* Output feedback for FB knob */
     float fb_sample;
@@ -617,6 +620,10 @@ static void apply_init_preset(synth_t *inst) {
     inst->sm_lpf_reso = inst->lpf_reso;
     inst->sm_hpf_reso = inst->hpf_reso;
     inst->sm_drive    = inst->p_drive;
+    inst->sm_v1_pitch = inst->v1_pitch + inst->v1_fine + inst->p_master_tune;
+    inst->sm_v2_pitch = inst->v2_pitch + inst->v2_fine + inst->v2_detune + inst->p_master_tune;
+    inst->sm_volume   = inst->p_volume;
+    inst->sm_mg_depth = inst->p_mg_depth;
 }
 
 
@@ -2562,9 +2569,10 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         /* Global MG Depth (root-page knob) + mod-wheel→MG. Scales BOTH MG
          * outputs before they reach any attenuator or patchbay destination.
          * (Previously p_mg_depth was stored but never read — MG Depth was dead.) */
-        float mg_depth_eff = clampf(inst->p_mg_depth + inst->mw_mg * inst->mod_wheel, 0.0f, 1.0f);
-        mg_tri *= mg_depth_eff;
-        mg_sq  *= mg_depth_eff;
+        float mg_depth_tgt = clampf(inst->p_mg_depth + inst->mw_mg * inst->mod_wheel, 0.0f, 1.0f);
+        inst->sm_mg_depth += SMOOTH_20MS * (mg_depth_tgt - inst->sm_mg_depth);
+        mg_tri *= inst->sm_mg_depth;
+        mg_sq  *= inst->sm_mg_depth;
 
         /* S&H */
         inst->sh_phase += sh_rate_hz * INV_SR;
@@ -2670,8 +2678,15 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
          * ±1 → ±1 octave when fully present. */
         float jack_vco2_cv_sig = jack_vco2_cv(inst, inst->pb_jack[8], sh, noise_smoothed);
 
-        float v1_semi = inst->v1_pitch + inst->v1_fine + inst->pitch_bend + drift_v1_semi + master_semi;
-        float v2_semi = inst->v2_pitch + inst->v2_fine + inst->v2_detune + inst->pitch_bend + drift_v2_semi + master_semi;
+        /* Smooth the static (knob) pitch at ~20 ms so turning Tune/Fine/Detune
+         * or flipping the Scale octave glides like an analog VCO settling, while
+         * pitch bend, drift and jack modulation stay immediate. */
+        float v1_static = inst->v1_pitch + inst->v1_fine + master_semi;
+        float v2_static = inst->v2_pitch + inst->v2_fine + inst->v2_detune + master_semi;
+        inst->sm_v1_pitch += SMOOTH_20MS * (v1_static - inst->sm_v1_pitch);
+        inst->sm_v2_pitch += SMOOTH_20MS * (v2_static - inst->sm_v2_pitch);
+        float v1_semi = inst->sm_v1_pitch + inst->pitch_bend + drift_v1_semi;
+        float v2_semi = inst->sm_v2_pitch + inst->pitch_bend + drift_v2_semi;
         /* Add jack-routed pitch modulation. The MG/T.EXT and EG1/EXT VCO
          * MIXER attenuators (vco_mg_int, vco_eg_int) already scale the
          * signals; bipolar ±1 × 12 = ±1 octave at attenuator=1. */
@@ -2799,21 +2814,24 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         float hpf_mod = inst->hpf_mg_int * jack_total_sig
                       + inst->hpf_eg_int * jack_hpf_cv_sig;
 
-        float lpf_cut_target = clampf(inst->lpf_cut + kt * 0.5f
+        /* Smooth the base cutoff/reso KNOBS at ~20 ms for an analog feel, THEN
+         * add the envelope/LFO/drift modulation unsmoothed so filter sweeps and
+         * the MG stay snappy. (The old code smoothed the fully-summed target at
+         * ~0.16 ms — no real analog glide on the knob, and it would have dulled
+         * the envelope if simply slowed down.) */
+        inst->sm_lpf_cut  += SMOOTH_20MS * (inst->lpf_cut  - inst->sm_lpf_cut);
+        inst->sm_hpf_cut  += SMOOTH_20MS * (inst->hpf_cut  - inst->sm_hpf_cut);
+        inst->sm_lpf_reso += SMOOTH_20MS * (inst->lpf_reso - inst->sm_lpf_reso);
+        inst->sm_hpf_reso += SMOOTH_20MS * (inst->hpf_reso - inst->sm_hpf_reso);
+
+        float lpf_cut_target = clampf(inst->sm_lpf_cut + kt * 0.5f
                                       + lpf_mod
                                       + inst->mod_wheel * inst->mw_filt * 0.5f
                                       + drift_lpf_off, 0.0f, 1.0f);
-        float hpf_cut_target = clampf(inst->hpf_cut + hpf_mod + drift_hpf_off, 0.0f, 1.0f);
-        float reso_target    = clampf(inst->lpf_reso, 0.0f, 1.0f);
-        float hpf_reso_target = clampf(inst->hpf_reso, 0.0f, 1.0f);
+        float hpf_cut_target = clampf(inst->sm_hpf_cut + hpf_mod + drift_hpf_off, 0.0f, 1.0f);
 
-        inst->sm_lpf_cut  += SMOOTH * (lpf_cut_target - inst->sm_lpf_cut);
-        inst->sm_hpf_cut  += SMOOTH * (hpf_cut_target - inst->sm_hpf_cut);
-        inst->sm_lpf_reso += SMOOTH * (reso_target - inst->sm_lpf_reso);
-        inst->sm_hpf_reso += SMOOTH * (hpf_reso_target - inst->sm_hpf_reso);
-
-        float lpf_hz = clampf(cutoff_to_hz(inst->sm_lpf_cut), 20.0f, 18000.0f);
-        float hpf_hz = clampf(cutoff_to_hz(inst->sm_hpf_cut), 20.0f, 18000.0f);
+        float lpf_hz = clampf(cutoff_to_hz(lpf_cut_target), 20.0f, 18000.0f);
+        float hpf_hz = clampf(cutoff_to_hz(hpf_cut_target), 20.0f, 18000.0f);
 
         /* Ext Sig jack — when patched, audio from the selected source (ESP/Noise/
          * mixer feedback) is summed into the filter input. Default 0 = no extra.
@@ -2865,7 +2883,8 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
          * (Hold→Attack, Attack→Decay, Decay→Sustain, Sustain→Release) below
          * audibility, while preserving the envelope's musical timing. */
         v->sm_vca += 0.10f * (vca_target - v->sm_vca);
-        float final = filt_out * v->sm_vca * inst->p_volume;
+        inst->sm_volume += SMOOTH_20MS * (inst->p_volume - inst->sm_volume);
+        float final = filt_out * v->sm_vca * inst->sm_volume;
 
         /* === Output stage — component modeling for vintage character ===
          * Three subtle stages applied in series before the safety limiter:
