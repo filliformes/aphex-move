@@ -81,7 +81,7 @@
           "knobs": ["drift","drive","key_track","ms10_mode","v1_drift","v2_drift","mw_mg","mw_filt"],
           "params": [
             "drift","drive","key_track","ms10_mode","v1_drift","v2_drift","mw_mg","mw_filt",
-            "filter_mode","x_mod_amt","v2_pw","v2_detune"
+            "filter_mode","x_mod_amt","v2_pw","v2_detune","vel_amt"
           ]
         }
       }
@@ -179,7 +179,8 @@
       {"key":"v2_drift","name":"V2 Drift","type":"float","min":0,"max":1,"step":0.01,"default":0.18,"description":"Per-VCO2 drift trim"},
       {"key":"x_mod_amt","name":"X-Mod Amt","type":"float","min":0,"max":1,"step":0.01,"default":0,"description":"Continuous X-Mod depth (Modern; original is on/off only)"},
       {"key":"mw_mg","name":"MW→MG","type":"float","min":0,"max":1,"step":0.01,"default":0,"description":"Mod wheel → MG depth (Modern)"},
-      {"key":"mw_filt","name":"MW→Filt","type":"float","min":0,"max":1,"step":0.01,"default":0,"description":"Mod wheel → LPF cutoff (Modern)"}
+      {"key":"mw_filt","name":"MW→Filt","type":"float","min":0,"max":1,"step":0.01,"default":0,"description":"Mod wheel → LPF cutoff (Modern)"},
+      {"key":"vel_amt","name":"Vel→Amp","type":"float","min":0,"max":1,"step":0.01,"default":0.8,"description":"Velocity → amplitude depth: 0 = every note full level (velocity ignored), 1 = full dynamic range. Floor + gentle curve keep soft hits audible."}
     ]
   }
 }

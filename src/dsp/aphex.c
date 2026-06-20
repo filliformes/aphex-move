@@ -45,6 +45,7 @@
 #define INV_SR     (1.0f / 44100.0f)
 #define PI          3.14159265359f
 #define TWO_PI      6.28318530718f
+#define VEL_FLOOR   0.25f   /* softest-pad-hit gain floor (at full Vel→Amp depth) */
 
 #define BLOCK       128
 
@@ -192,7 +193,7 @@ typedef struct {
     float   p_drift;
 
     /* Performance */
-    float p_drive, p_volume;
+    float p_drive, p_volume, p_vel_amt;
     float p_mg_rate, p_mg_depth, p_glide;
     float p_master_tune;    /* MS-20 Master Tune, normalized ±1 = ±100 cents */
     int   p_octave;
@@ -561,6 +562,7 @@ static void destroy_instance(void *instance) {
 
 static void apply_init_preset(synth_t *inst) {
     inst->p_drive = 0.25f; inst->p_volume = 0.7f;     /* a touch of grit baseline */
+    inst->p_vel_amt = 0.8f;                            /* velocity→amp depth (floor+curve protect soft hits) */
     inst->p_mg_rate = 0.3f; inst->p_mg_depth = 0.4f; inst->p_glide = 0.0f;
     inst->p_master_tune = 0.0f;
     inst->p_octave = 0; inst->p_preset = 0;
@@ -1642,6 +1644,7 @@ static void set_param(void *instance, const char *key, const char *val) {
 
     /* Floats — root */
     if (EQ(key, "drive"))     { inst->p_drive = clampf(atof(val), 0.0f, 1.0f); return; }
+    if (EQ(key, "vel_amt"))   { inst->p_vel_amt = clampf(atof(val), 0.0f, 1.0f); return; }
     if (EQ(key, "mg_rate"))   { inst->p_mg_rate = atof(val); return; }
     if (EQ(key, "mg_depth"))  { inst->p_mg_depth = atof(val); return; }
     if (EQ(key, "volume"))    { inst->p_volume = atof(val); return; }
@@ -1882,13 +1885,14 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
               "\"modern\":{"
                 "\"name\":\"Modern\","
                 "\"knobs\":[\"drift\",\"drive\",\"key_track\",\"ms10_mode\",\"v1_drift\",\"v2_drift\",\"mw_mg\",\"mw_filt\"],"
-                "\"params\":[\"drift\",\"drive\",\"key_track\",\"ms10_mode\",\"v1_drift\",\"v2_drift\",\"mw_mg\",\"mw_filt\",\"filter_mode\",\"x_mod_amt\",\"v2_pw\",\"v2_detune\"]"
+                "\"params\":[\"drift\",\"drive\",\"key_track\",\"ms10_mode\",\"v1_drift\",\"v2_drift\",\"mw_mg\",\"mw_filt\",\"filter_mode\",\"x_mod_amt\",\"v2_pw\",\"v2_detune\",\"vel_amt\"]"
               "}"
             "}}");
     }
 
     /* Floats — root */
     if (EQ(key, "drive"))     return snprintf(buf, buf_len, "%.4f", inst->p_drive);
+    if (EQ(key, "vel_amt"))   return snprintf(buf, buf_len, "%.4f", inst->p_vel_amt);
     if (EQ(key, "mg_rate"))   return snprintf(buf, buf_len, "%.4f", inst->p_mg_rate);
     if (EQ(key, "mg_depth"))  return snprintf(buf, buf_len, "%.4f", inst->p_mg_depth);
     if (EQ(key, "volume"))    return snprintf(buf, buf_len, "%.4f", inst->p_volume);
@@ -2024,6 +2028,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
 
         /* Performance */
         ST_F("drive",        inst->p_drive);
+        ST_F("vel_amt",      inst->p_vel_amt);
         ST_F("mg_rate",      inst->p_mg_rate);
         ST_F("mg_depth",     inst->p_mg_depth);
         ST_F("portamento",   inst->p_glide);
@@ -2843,7 +2848,14 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
          * Per spec the jack has no attenuator, but in practice values >1 push
          * the chain into hard clipping (final tanh can't soak it all). Clamp
          * the sum so we stay inside the soft-saturation sweet spot. */
-        float vca_target = clampf(v->e2 + jack_vca_init, 0.0f, 1.0f) * v->velocity;
+        /* Velocity → amplitude. A sqrt curve perceptually flattens the response
+         * so soft hits don't collapse; VEL_FLOOR keeps the quietest hit audible;
+         * p_vel_amt blends between "velocity ignored" (0 → every note full
+         * level) and full dynamic range (1). At depth 1 the range is
+         * VEL_FLOOR..1 (~-12 dB..0); the old code was a raw linear ×velocity. */
+        float vshaped  = VEL_FLOOR + (1.0f - VEL_FLOOR) * sqrtf(v->velocity);
+        float vel_gain = 1.0f - inst->p_vel_amt * (1.0f - vshaped);
+        float vca_target = clampf(v->e2 + jack_vca_init, 0.0f, 1.0f) * vel_gain;
         /* VCA drift: subtle ±4% gain wander (additive on the multiplicative gain).
          * Models slight changes in VCA gain due to power supply / thermal drift. */
         vca_target *= 1.0f + drift_vca(&inst->drift);
