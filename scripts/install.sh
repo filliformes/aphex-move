@@ -23,7 +23,8 @@ fi
 
 echo "Installing $MODULE_ID to ableton@$MOVE_HOST..."
 ssh "ableton@$MOVE_HOST" "mkdir -p $DEST"
-scp "$ROOT/dist/$MODULE_ID/dsp.so" "$ROOT/dist/$MODULE_ID/module.json" "ableton@$MOVE_HOST:$DEST/"
+HELP=""; [ -f "$ROOT/dist/$MODULE_ID/help.json" ] && HELP="$ROOT/dist/$MODULE_ID/help.json"
+scp "$ROOT/dist/$MODULE_ID/dsp.so" "$ROOT/dist/$MODULE_ID/module.json" $HELP "ableton@$MOVE_HOST:$DEST/"
 ssh "ableton@$MOVE_HOST" "chown -R ableton:users $DEST && chmod 755 $DEST/dsp.so"
 
 echo "Installed to $DEST"
