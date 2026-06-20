@@ -47,7 +47,7 @@
         },
         "mixer": {
           "name": "Mixer",
-          "knobs": ["mix_v1","mix_v2","vco_mg","vco_eg","mix_esp"],
+          "knobs": ["mix_v1","mix_v2","vco_mg","vco_eg","mix_esp","mix_sub","mix_noise","mix_fb"],
           "params": ["mix_v1","mix_v2","vco_mg","vco_eg","mix_esp","mix_sub","mix_noise","noise_color","mix_fb"]
         },
         "filter": {
@@ -62,7 +62,7 @@
         },
         "mg_esp": {
           "name": "MG / ESP",
-          "knobs": ["mg_freq","mg_shape","esp_in_gain","esp_lo_cut","esp_hi_cut","esp_cv_adj","esp_threshold"],
+          "knobs": ["mg_freq","mg_shape","esp_in_gain","esp_lo_cut","esp_hi_cut","esp_cv_adj","esp_threshold","mg_pw"],
           "params": [
             "mg_freq","mg_shape","esp_in_gain","esp_lo_cut","esp_hi_cut","esp_cv_adj","esp_threshold",
             "mg_depth","mg_pw","esp_pitch_slew","esp_env_atk","esp_env_rel","esp_aud_mix","esp_pitch_mode","esp_gate_pol"
