@@ -1,7 +1,7 @@
 {
   "id": "aphex",
   "name": "Aphex",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "api_version": 2,
   "description": "Korg MS-10/MS-20 hybrid mono synth — faithful panel layout with KORG-35 (REV.1) and OTA (REV.2) filter circuits, source-side patchbay, ESP, and a Modern page for trim/extras.",
   "author": "Filliformes",
