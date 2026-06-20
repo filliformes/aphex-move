@@ -48,6 +48,12 @@
 
 #define BLOCK       128
 
+/* filter_lpf_dispatch/filter_hpf_dispatch pun k35_t* <-> k35_ota_t* (both are
+ * three TPT integrator floats). Guard that assumption at compile time — editing
+ * one struct without the other now fails the build instead of corrupting state. */
+_Static_assert(sizeof(k35_t) == sizeof(k35_ota_t),
+               "k35_t and k35_ota_t must stay layout-compatible (filter dispatch puns between them)");
+
 /* Wave enums — MUST match module.json's options arrays exactly, otherwise
  * parse_enum falls through to atoi(val) which returns 0 for any non-numeric
  * string, silently mapping all "unknown" wave names to the first option.
@@ -62,7 +68,11 @@ static const char *SYNC_NAMES[2]      = {"Off","On"};
 static const char *FILT_MODE_NAMES[4] = {"HP+LP","LP only","HP only","Notch"};
 /* Filter circuit revision: REV.1 = early-MS-20/MS-10 KORG-35 (creamy fuzz),
  * REV.2 = late-MS-20 LM13600 OTA (cleaner howl). */
-static const char *FILT_REV_NAMES[2] = {"REV.1","REV.2"};
+static const char *FILT_REV_NAMES[2] = {"REV.1 KORG-35","REV.2 OTA"};
+/* VCO SCALE switches (organ footage). 8' is the reference (0 semitone offset).
+ * Each step = one octave (12 st), NOT one semitone. */
+static const char *V1_SCALE_NAMES[4] = {"32'","16'","8'","4'"};  /* offset (idx-2)*12 */
+static const char *V2_SCALE_NAMES[4] = {"16'","8'","4'","2'"};   /* offset (idx-1)*12 */
 static const char *ESP_PITCH_MODES[3] = {"Off","Track","Quantized"};
 static const char *GATE_POL_NAMES[2]  = {"+","-"};
 static const char *ON_OFF_NAMES[2]    = {"Off","On"};
@@ -103,9 +113,9 @@ static const char *PB_JACK_NAMES_TOTAL[9]  = {"MG","Wheel","ESP CV","ESP Env","S
 #define PB_JACK_NAMES_TOTAL_N 9
 static const char *PB_JACK_NAMES_FREQ[7]   = {"EG1","EG2","ESP Env","Wheel","S&H","Noise","None"};
 #define PB_JACK_NAMES_FREQ_N 7
-static const char *PB_JACK_NAMES_HPF[7]    = {"EG2","EG1","ESP Env","Wheel","S&H","Noise","None"};
+static const char *PB_JACK_NAMES_HPF[7]    = {"EG1","EG2","ESP Env","Wheel","S&H","Noise","None"};
 #define PB_JACK_NAMES_HPF_N 7
-static const char *PB_JACK_NAMES_LPF[7]    = {"EG2","EG1","ESP Env","Wheel","S&H","Noise","None"};
+static const char *PB_JACK_NAMES_LPF[7]    = {"EG1","EG2","ESP Env","Wheel","S&H","Noise","None"};
 #define PB_JACK_NAMES_LPF_N 7
 static const char *PB_JACK_NAMES_VCA[6]    = {"None","Wheel","ESP Env","EG1","S&H","Noise"};
 #define PB_JACK_NAMES_VCA_N 6
@@ -184,7 +194,7 @@ typedef struct {
     /* Performance */
     float p_drive, p_volume;
     float p_mg_rate, p_mg_depth, p_glide;
-    float p_master_tune;    /* MS-20 Master Tune, ±100 cents (stored as cents) */
+    float p_master_tune;    /* MS-20 Master Tune, normalized ±1 = ±100 cents */
     int   p_octave;
     int   p_preset;
 
@@ -261,6 +271,7 @@ typedef struct {
     float esp_pitch_raw, esp_pitch_smoothed;   /* V/oct-style CV */
     float esp_env_smoothed;
     int   esp_gate_state;
+    float esp_lc_z, esp_hc_z;  /* one-pole states for Lo Cut (HPF) / Hi Cut (LPF) */
     /* YIN pitch tracker buffer */
     float esp_buf[2048];
     int   esp_buf_pos;
@@ -346,6 +357,17 @@ static inline float fast_tanh(float x) {
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
 
+/* Fast 2^x for per-sample VCO pitch. Integer part via ldexpf, fractional part
+ * via a 6-term minimax polynomial. Max relative error ~1e-5 → under 0.001 cents
+ * of detuning (inaudible), but far cheaper than powf(2,x) called twice/sample. */
+static inline float fast_exp2(float x) {
+    float xi = floorf(x);
+    float f  = x - xi;
+    float p  = 1.0f + f * (0.6931472f + f * (0.2402265f + f * (0.0555041f
+                     + f * (0.0096181f + f * 0.0013333f))));
+    return ldexpf(p, (int)xi);
+}
+
 /* MIDI note → frequency */
 static float note_to_freq(int note) {
     return 440.0f * powf(2.0f, (note - 69) / 12.0f);
@@ -410,14 +432,32 @@ static inline float polyblep(float t, float dt) {
     return 0.0f;
 }
 
+/* PolyBLAMP residual — anti-aliases slope discontinuities (triangle corners),
+ * the BLEP analogue for waveforms continuous in value but not derivative. */
+static inline float polyblamp(float t, float dt) {
+    if (t < dt) {
+        t = t / dt - 1.0f;
+        return -(1.0f / 3.0f) * t * t * t;
+    } else if (t > 1.0f - dt) {
+        t = (t - 1.0f) / dt + 1.0f;
+        return (1.0f / 3.0f) * t * t * t;
+    }
+    return 0.0f;
+}
+
 /* ── Oscillators ─────────────────────────────────────────────────────────── */
 
 static float osc_render(int wave, float phase, float dt, float pw) {
     /* phase in [0,1), dt = freq/SR */
     float s = 0.0f;
     switch (wave) {
-        case 0: { /* Triangle */
+        case 0: { /* Triangle — polyBLAMP-corrected corners (anti-aliased) */
             s = (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
+            /* Two slope discontinuities per cycle: min at phase 0, max at 0.5.
+             * Slope magnitude is 4; residual scaled by slope*dt rounds them. */
+            s += 4.0f * dt * polyblamp(phase, dt);
+            float pmax = phase + 0.5f; if (pmax >= 1.0f) pmax -= 1.0f;
+            s -= 4.0f * dt * polyblamp(pmax, dt);
             break;
         }
         case 1: { /* Saw with polyblep */
@@ -540,10 +580,10 @@ static void apply_init_preset(synth_t *inst) {
     inst->mix_noise = 0; inst->noise_color = 0; inst->mix_esp = 0; inst->mix_fb = 0;
 
     inst->lpf_cut = 0.6f; inst->lpf_reso = 0.2f; inst->hpf_cut = 0.0f; inst->hpf_reso = 0.0f;
-    inst->key_track = 0.5f; inst->filter_mode = 1;   /* LP only by default for usable tone */
+    inst->key_track = 0.5f; inst->filter_mode = 0;   /* HP+LP cascade (MS-20 default) */
     inst->filter_rev = 0;                             /* REV.1 = KORG-35 by default */
     inst->hpf_mg_int = 0.0f; inst->hpf_eg_int = 0.0f;
-    inst->lpf_mg_int = 0.0f; inst->lpf_eg_int = 0.6f; /* classic auto-wah feel */
+    inst->lpf_mg_int = 0.12f; inst->lpf_eg_int = 0.6f; /* subtle MG wobble + EG1 auto-wah */
     inst->vco_mg_int = 0.0f; inst->vco_eg_int = 0.0f; /* VCO pitch mod attenuators closed */
 
     /* Vintage envelope timings — MS-20 EGs were rarely as snappy as digital.
@@ -1382,8 +1422,8 @@ static void on_midi(void *instance, const uint8_t *msg, int len, int source) {
  * patchbay can re-route most jacks. */
 static void rnd_full(synth_t *inst) {
     /* Oscillators */
-    inst->v1_pitch = (int)(rand_b(&inst->rng) * 12);
-    inst->v2_pitch = (int)(rand_b(&inst->rng) * 12);
+    inst->v1_pitch = ((int)(rand_f(&inst->rng) * 4.0f) - 2) * 12;  /* 32'/16'/8'/4' */
+    inst->v2_pitch = ((int)(rand_f(&inst->rng) * 4.0f) - 1) * 12;  /* 16'/8'/4'/2' */
     inst->v1_wave  = rand32(&inst->rng) & 3;
     inst->v2_wave  = rand32(&inst->rng) & 3;
     /* Prevent VCO1=Noise + VCO2=Ring + low mix → all silent (Ring needs an
@@ -1607,7 +1647,7 @@ static void set_param(void *instance, const char *key, const char *val) {
     if (EQ(key, "volume"))    { inst->p_volume = atof(val); return; }
     if (EQ(key, "drift"))     { inst->p_drift = clampf(atof(val), 0.0f, 1.0f); return; }
     if (EQ(key, "octave"))    { inst->p_octave = atoi(val); return; }
-    if (EQ(key, "master_tune")) { inst->p_master_tune = clampf(atof(val), -100.0f, 100.0f); return; }
+    if (EQ(key, "master_tune")) { inst->p_master_tune = clampf(atof(val), -1.0f, 1.0f); return; }
     /* Momentary trigger button — int 0-127 momentary. Each encoder click fires.
      * On firing, retrigger envelopes from current state (same as a keyboard
      * note-on but without changing the pitch). */
@@ -1635,7 +1675,10 @@ static void set_param(void *instance, const char *key, const char *val) {
     }
 
     /* VCO1 */
-    if (EQ(key, "v1_pitch"))     { inst->v1_pitch = atof(val); return; }
+    /* Scale is an octave SWITCH (enum), not a free semitone value: each step = 1
+     * octave. Host sends the enum index ("0".."3"); map to semitone offset with
+     * 8' as the 0 reference. (Old code used atof → 1 semitone/step bug.) */
+    if (EQ(key, "v1_pitch"))     { inst->v1_pitch = (parse_enum(val, V1_SCALE_NAMES, 4) - 2) * 12; return; }
     if (EQ(key, "v1_fine"))      { inst->v1_fine = atof(val); return; }
     if (EQ(key, "v1_wave"))      { inst->v1_wave = parse_enum(val, V1_WAVE_NAMES, 4); return; }
     if (EQ(key, "v1_pw"))        { inst->v1_pw = atof(val); return; }
@@ -1645,7 +1688,7 @@ static void set_param(void *instance, const char *key, const char *val) {
     if (EQ(key, "v1_drift"))     { inst->v1_drift = atof(val); return; }
 
     /* VCO2 */
-    if (EQ(key, "v2_pitch"))   { inst->v2_pitch = atof(val); return; }
+    if (EQ(key, "v2_pitch"))   { inst->v2_pitch = (parse_enum(val, V2_SCALE_NAMES, 4) - 1) * 12; return; }
     if (EQ(key, "v2_fine"))    { inst->v2_fine = atof(val); return; }
     if (EQ(key, "v2_wave"))    { inst->v2_wave = parse_enum(val, V2_WAVE_NAMES, 4); return; }
     if (EQ(key, "v2_pw"))      { inst->v2_pw = atof(val); return; }
@@ -1889,7 +1932,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     if (EQ(key, "vco_eg")) return snprintf(buf, buf_len, "%.4f", inst->vco_eg_int);
 
     /* VCO1 */
-    if (EQ(key, "v1_pitch"))     return snprintf(buf, buf_len, "%.0f", inst->v1_pitch);
+    if (EQ(key, "v1_pitch"))     return snprintf(buf, buf_len, "%s", V1_SCALE_NAMES[clampi((int)roundf(inst->v1_pitch / 12.0f) + 2, 0, 3)]);
     if (EQ(key, "v1_fine"))      return snprintf(buf, buf_len, "%.4f", inst->v1_fine);
     if (EQ(key, "v1_wave"))      return snprintf(buf, buf_len, "%s", V1_WAVE_NAMES[clampi(inst->v1_wave, 0, 3)]);
     if (EQ(key, "v1_pw"))        return snprintf(buf, buf_len, "%.4f", inst->v1_pw);
@@ -1899,7 +1942,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     if (EQ(key, "v1_drift"))     return snprintf(buf, buf_len, "%.4f", inst->v1_drift);
 
     /* VCO2 */
-    if (EQ(key, "v2_pitch"))    return snprintf(buf, buf_len, "%.0f", inst->v2_pitch);
+    if (EQ(key, "v2_pitch"))    return snprintf(buf, buf_len, "%s", V2_SCALE_NAMES[clampi((int)roundf(inst->v2_pitch / 12.0f) + 1, 0, 3)]);
     if (EQ(key, "v2_fine"))     return snprintf(buf, buf_len, "%.4f", inst->v2_fine);
     if (EQ(key, "v2_wave"))     return snprintf(buf, buf_len, "%s", V2_WAVE_NAMES[clampi(inst->v2_wave, 0, 3)]);
     if (EQ(key, "v2_pw"))       return snprintf(buf, buf_len, "%.4f", inst->v2_pw);
@@ -2226,33 +2269,36 @@ static inline float jack_vco_freq(synth_t *inst, int sel, float sh, float noise_
     }
 }
 
-/* HPF EG/Ext — replaces EG2 in HPF EG2/EXT attenuator. */
+/* HPF EG/Ext — feeds the HPF EG/EXT attenuator. Envelope sources are UNIPOLAR
+ * (0..1) so they only OPEN the filter; LFO/S&H/Wheel/Noise stay bipolar. */
 static inline float jack_hpf_cv(synth_t *inst, int sel, float sh, float noise_smoothed) {
     voice_t *v = &inst->voice;
     switch (sel) {
-        case 0:  return v->e2 * 2.0f - 1.0f;              /* Default: EG2 */
-        case 1:  return v->e1 * 2.0f - 1.0f;              /* EG1 */
+        case 0:  return v->e1;                            /* Default: EG1 (filter env, unipolar) */
+        case 1:  return v->e2;                            /* EG2 (unipolar) */
         case 2:  return inst->esp_env_smoothed * 2.0f - 1.0f;
         case 3:  return inst->mod_wheel * 2.0f - 1.0f;
         case 4:  return sh;
         case 5:  return noise_smoothed;
         case 6:  return 0.0f;
-        default: return v->e2 * 2.0f - 1.0f;
+        default: return v->e1;
     }
 }
 
-/* LPF EG/Ext — replaces EG2 in LPF EG2/EXT attenuator. */
+/* LPF EG/Ext — feeds the LPF EG/EXT attenuator. EG1 is the default filter
+ * envelope (unipolar: opens the filter only — never pulls cutoff below base,
+ * so lowering sustain/decay can no longer silence a held note). */
 static inline float jack_lpf_cv(synth_t *inst, int sel, float sh, float noise_smoothed) {
     voice_t *v = &inst->voice;
     switch (sel) {
-        case 0:  return v->e2 * 2.0f - 1.0f;              /* Default: EG2 */
-        case 1:  return v->e1 * 2.0f - 1.0f;
+        case 0:  return v->e1;                            /* Default: EG1 (filter env, unipolar) */
+        case 1:  return v->e2;                            /* EG2 (unipolar) */
         case 2:  return inst->esp_env_smoothed * 2.0f - 1.0f;
         case 3:  return inst->mod_wheel * 2.0f - 1.0f;
         case 4:  return sh;
         case 5:  return noise_smoothed;
         case 6:  return 0.0f;
-        default: return v->e2 * 2.0f - 1.0f;
+        default: return v->e1;
     }
 }
 
@@ -2359,6 +2405,15 @@ static void update_esp(synth_t *inst, const int16_t *audio_in, int frames) {
     float env_atk_coef = 1.0f - expf(-1.0f / (inst->esp_env_atk * SAMPLE_RATE + 1.0f));
     float env_rel_coef = 1.0f - expf(-1.0f / (inst->esp_env_rel * SAMPLE_RATE + 1.0f));
 
+    /* ESP band-limit coefficients (block-invariant). Lo Cut = one-pole high-pass
+     * (50 Hz..2.5 kHz), Hi Cut = one-pole low-pass (100 Hz..5 kHz). These shape
+     * the signal the env follower / gate / pitch tracker and the routed ESP Audio
+     * all see — previously stored but never applied, so the knobs did nothing. */
+    float lc_hz = 50.0f  * powf(50.0f, inst->esp_low_cut);
+    float hc_hz = 100.0f * powf(50.0f, inst->esp_high_cut);
+    float lc_a  = 1.0f - expf(-TWO_PI * lc_hz * INV_SR);
+    float hc_a  = 1.0f - expf(-TWO_PI * hc_hz * INV_SR);
+
     /* Soft noise gate: below ~−60 dBFS we stop pulling the envelope UP toward
      * ambient hiss but still allow it to decay. Prevents the env follower
      * from latching onto the floor when no signal is present (the Move's
@@ -2369,6 +2424,11 @@ static void update_esp(synth_t *inst, const int16_t *audio_in, int frames) {
         float l = audio_in[i*2] / 32768.0f;
         float r = audio_in[i*2+1] / 32768.0f;
         float in = (l + r) * 0.5f * inst->esp_in_gain;
+        /* Lo Cut (high-pass residue) then Hi Cut (low-pass) */
+        inst->esp_lc_z += lc_a * (in - inst->esp_lc_z);
+        in -= inst->esp_lc_z;
+        inst->esp_hc_z += hc_a * (in - inst->esp_hc_z);
+        in = inst->esp_hc_z;
         last = in;
         float abs_in = fabsf(in);
         if (abs_in < NOISE_FLOOR) abs_in = 0.0f;
@@ -2440,18 +2500,25 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
     /* Pre-compute key tracking offset */
     float kt = (v->note - 60) / 12.0f * inst->key_track;  /* in octaves */
 
+    /* Block-invariant smoothing coefficients — hoisted out of the per-sample
+     * loop (they depend only on block-constant params, so the expf() ran 44100×
+     * per second for nothing). */
+    int   glide_on  = inst->p_glide > 0.001f;
+    float glide_amt = glide_on
+        ? (1.0f - expf(-1.0f / (inst->p_glide * 2.0f * SAMPLE_RATE + 1.0f)))
+        : 1.0f;
+    float sh_coef   = (inst->sh_smooth > 0.001f)
+        ? (1.0f - expf(-1.0f / (inst->sh_smooth * 0.05f * SAMPLE_RATE + 1.0f)))
+        : 1.0f;
+
     for (int i = 0; i < frames; i++) {
         /* Per-sample drift advance — interpolates the slow random walk and
          * holds flutter phases stable across the block. Cheap (~5 instructions). */
         drift_sample_tick(&inst->drift);
 
         /* === Glide === */
-        if (inst->p_glide > 0.001f) {
-            float glide_coef = expf(-1.0f / (inst->p_glide * 2.0f * SAMPLE_RATE + 1.0f));
-            v->freq += (v->freq_target - v->freq) * (1.0f - glide_coef);
-        } else {
-            v->freq = v->freq_target;
-        }
+        if (glide_on) v->freq += (v->freq_target - v->freq) * glide_amt;
+        else          v->freq = v->freq_target;
 
         /* === Modulation generators per sample === */
 
@@ -2487,15 +2554,19 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         float pw_thresh = clampf(1.0f - inst->mg_pw, 0.05f, 0.95f);
         float mg_sq = (inst->mg_phase < pw_thresh) ? 1.0f : -1.0f;
 
+        /* Global MG Depth (root-page knob) + mod-wheel→MG. Scales BOTH MG
+         * outputs before they reach any attenuator or patchbay destination.
+         * (Previously p_mg_depth was stored but never read — MG Depth was dead.) */
+        float mg_depth_eff = clampf(inst->p_mg_depth + inst->mw_mg * inst->mod_wheel, 0.0f, 1.0f);
+        mg_tri *= mg_depth_eff;
+        mg_sq  *= mg_depth_eff;
+
         /* S&H */
         inst->sh_phase += sh_rate_hz * INV_SR;
         if (inst->sh_phase >= 1.0f) {
             inst->sh_phase -= 1.0f;
             inst->sh_target = rand_b(&inst->rng);
         }
-        float sh_coef = (inst->sh_smooth > 0.001f)
-            ? (1.0f - expf(-1.0f / (inst->sh_smooth * 0.05f * SAMPLE_RATE + 1.0f)))
-            : 1.0f;
         inst->sh_value += sh_coef * (inst->sh_target - inst->sh_value);
         float sh = inst->sh_value;
 
@@ -2578,7 +2649,7 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         float drift_v1_semi = drift_pitch_v1(&inst->drift) * inst->v1_drift / 100.0f;
         float drift_v2_semi = drift_pitch_v2(&inst->drift) * inst->v2_drift / 100.0f;
         /* Master Tune (±100 cents, MS-20 panel knob) — applied to both VCOs equally. */
-        float master_semi = inst->p_master_tune / 100.0f;
+        float master_semi = inst->p_master_tune;  /* ±1 knob = ±1 semitone = ±100 cents */
 
         /* MS-20 VCO MIXER FREQ MOD attenuators — these are the panel knobs at
          * the bottom of the VCO MIXER column on the original FS panel. They
@@ -2603,8 +2674,8 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         v2_semi += (vco_mod_mgtext + vco_mod_eg1ext) * 12.0f
                  + jack_vco2_cv_sig * 12.0f;
 
-        float v1_freq = v->freq * powf(2.0f, v1_semi / 12.0f);
-        float v2_freq = v->freq * powf(2.0f, v2_semi / 12.0f);
+        float v1_freq = v->freq * fast_exp2(v1_semi * (1.0f / 12.0f));
+        float v2_freq = v->freq * fast_exp2(v2_semi * (1.0f / 12.0f));
         if (inst->v2_xmod > 0.001f) {
             /* Cross-mod: VCO1 modulates VCO2 frequency */
             v2_freq *= 1.0f + inst->v2_xmod * 0.5f * sinf(inst->v1_pwm_phase * TWO_PI);
@@ -2701,8 +2772,12 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         /* === Drive (pre-filter) — MS-20 magic lives here ===
          * Use sm_drive (block-rate smoothed) instead of p_drive so the
          * tanh saturation level doesn't pop when the knob is turned. */
-        float drive_amt = 1.0f + inst->sm_drive * 5.0f;
-        float driven = fast_tanh(mix * drive_amt) / fast_tanh(drive_amt);
+        /* Pre-gain into the saturator grows harmonic content; the makeup term
+         * keeps loudness roughly constant so Drive colors rather than just gets
+         * louder. The old /fast_tanh(drive_amt) normalization cancelled the
+         * effect at the low input levels typical of a single oscillator. */
+        float drive_amt = 1.0f + inst->sm_drive * 9.0f;
+        float driven = fast_tanh(mix * drive_amt) * (0.6f + 0.4f / drive_amt);
 
         /* === Filter === */
         /* Per-sample smoothed cutoff (with modulation + analog drift offset).
