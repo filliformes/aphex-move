@@ -230,24 +230,17 @@ When `ms10_mode=On`, Aphex collapses to the MS-10 layout:
   Move's ARM64 (well within budget).
 
 ## Factory presets
-Seven presets shipped, accessible via the Preset menu on the root page. Each
-calls `apply_init_preset()` first, then overrides only what defines its
-character. Re-snapshots `pb_src_init[]` so "Init Mod" reverts to that preset.
+**41 presets** (Init + 40 character patches), accessible via the Preset menu on
+the root page. `PRESET_NAMES` / `PRESET_COUNT` in `aphex.c` and the `preset`
+enum in `module.json` are the source of truth and MUST stay in sync. Each
+`apply_preset_*` calls `apply_init_preset()` first, then overrides only what
+defines its character.
 
-1. **Init** — neutral starting point. REV.1, LP-only filter, mild env→filter.
-2. **MS-20 Bass** — REV.1 + sub osc + LPF reso 0.55 + EG2 punchy decay.
-   Iconic acid bass tone, leveraging KORG-35's creamy break-up.
-3. **Lead Scream** — V1+V2 saw, slight detune, REV.1 LPF reso 0.85 — sits on
-   the edge of self-osc for that aggressive MS-20 lead character.
-4. **ESP Mangler** — ESP audio routed through filter (Ext Sig jack=ESP Audio),
-   ESP audio also in mixer at 0.7, REV.2 for cleaner howl, MG modulating LPF.
-5. **Sync Lead** — V2 hard-synced to V1, V2 a 5th up, EG1 sweeps V2 freq via
-   VCO Master EG1/EXT path. REV.2 for cleaner sync edge.
-6. **Random Drone** — long EG2 hold (5s) + slow MG (0.1) + pronounced drift (0.6).
-   Demonstrates the MS-20 hold-stage trick for evolving drones.
-7. **Vocal Harmonizer** — KBD CV jack = ESP CV (pitch follows external audio),
-   V2 a 5th up for harmony, ESP Pitch Mode = Track. Plug in vocals, get a
-   parallel-5ths harmonizer.
+Distribution (inspired by Korg Collection MS-20 V2 and Arturia MS-20 V):
+8 Bass · 8 Lead · 4 Pad · 3 Keys · 3 Sequence · 5 SFX · 4 Drone · 5 ESP/External.
+
+`apply_init_preset()` defaults: REV.1, **HP+LP** filter cascade, EG1→filter
+(unipolar) + subtle MG→LPF wobble, EG2→amp.
 
 ## Critical constraints
 - NEVER allocate memory in `render_block` — all state lives in `synth_t`
@@ -297,9 +290,8 @@ Use the `/move-schwung-release` skill (commit, tag, push, CI builds, GitHub rele
 
 ## Source / license notes
 - All DSP is original (no GPL'd sources). Free to keep MIT.
-- K35 (src/dsp/k35.h) is clean-room from Pirkle AN-5/AN-7v2 + Zavalishin TPT —
-  validated by `src/dsp/k35_test.c` (7/7 passing: DC unity, HPF DC block,
-  high-reso stability, self-oscillation, passthrough above cutoff,
-  attenuation 5oct above cutoff). Compile + run:
-  `gcc -O2 -ffast-math -Wall -o /tmp/k35_test src/dsp/k35_test.c -lm && /tmp/k35_test`
-- ESP pitch tracker upgrade: YIN algorithm (port from Spectra) — still TODO.
+- K35 (src/dsp/k35.h) is clean-room from Pirkle AN-5/AN-7v2 + Zavalishin TPT.
+  No standalone test harness ships yet — filter stability (high-reso /
+  self-oscillation) is verified by ear on-device, not by an automated suite.
+- ESP pitch tracker: YIN algorithm (de Cheveigné & Kawahara 2002), implemented
+  in `src/dsp/yin.h` and used by `update_esp` — done, not a TODO.

@@ -41,6 +41,7 @@ jobs:
               /build/src/dsp/aphex.c \
               -lm
             cp /build/src/module.json /build/dist/aphex/
+            [ -f /build/src/help.json ] && cp /build/src/help.json /build/dist/aphex/
             tar -C /build/dist -czf /build/dist/aphex-module.tar.gz aphex/
           "
 

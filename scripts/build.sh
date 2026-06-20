@@ -29,6 +29,7 @@ CONTAINER_ID=$(docker create ${MODULE_ID}-builder bash -c "
       /build/src/dsp/$MODULE_ID.c \
       -lm
     cp /build/src/module.json /build/dist/$MODULE_ID/
+    [ -f /build/src/help.json ] && cp /build/src/help.json /build/dist/$MODULE_ID/
     echo '=== Build complete ==='
     ls -la /build/dist/$MODULE_ID/
     echo '=== GLIBC check ==='
@@ -51,6 +52,7 @@ fi
 mkdir -p "$ROOT/dist/$MODULE_ID"
 docker cp "$CONTAINER_ID:/build/dist/$MODULE_ID/dsp.so"      "$ROOT/dist/$MODULE_ID/dsp.so"
 docker cp "$CONTAINER_ID:/build/dist/$MODULE_ID/module.json" "$ROOT/dist/$MODULE_ID/module.json"
+docker cp "$CONTAINER_ID:/build/dist/$MODULE_ID/help.json"   "$ROOT/dist/$MODULE_ID/help.json" 2>/dev/null || true
 docker rm "$CONTAINER_ID" > /dev/null
 
 # Create release tarball.
