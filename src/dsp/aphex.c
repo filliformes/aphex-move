@@ -1,6 +1,6 @@
 /**
  * Aphex — Schwung sound generator
- * Author: Vincent Filiatrault
+ * Author: Filliformes
  * License: MIT
  *
  * MS-10 / MS-20 hybrid mono synth with semi-modular patchbay and ESP.
